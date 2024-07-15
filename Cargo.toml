@@ -1,0 +1,22 @@
+[package]
+name = "quizzy"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/frectonz/quizzy"
+description = "A configurable quiz app with a libSQL backend."
+authors = ["frectonz"]
+
+[dependencies]
+clap = { version = "4.5.9", features = ["derive"] }
+color-eyre = "0.6.3"
+futures = "0.3.30"
+include_dir = "0.7.4"
+libsql = { git = "https://github.com/tursodatabase/libsql.git", features = ["remote"] }
+maud = { version = "0.26.0", features = ["warp"] }
+serde = { version = "1.0.204", features = ["derive"] }
+tokio = { version = "1.38.0", features = ["full"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+ulid = "1.1.3"
+warp = "0.3.7"
+
