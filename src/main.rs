@@ -102,6 +102,8 @@ mod db {
     use libsql::params;
     use ulid::Ulid;
 
+    use crate::model::{Question, Questions};
+
     #[derive(Clone)]
     pub struct Db {
         db: Arc<libsql::Database>,
@@ -138,6 +140,44 @@ mod db {
                 r#"
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY
+            )
+                "#,
+                (),
+            )
+            .await?;
+
+            conn.execute(
+                r#"
+            CREATE TABLE IF NOT EXISTS quizzes (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL
+            )
+                "#,
+                (),
+            )
+            .await?;
+
+            conn.execute(
+                r#"
+            CREATE TABLE IF NOT EXISTS questions (
+                id INTEGER PRIMARY KEY,
+                question TEXT NOT NULL,
+                quiz_id INTEGER NOT NULL,
+                FOREIGN KEY(quiz_id) REFERENCES quizzes(id)
+            )
+                "#,
+                (),
+            )
+            .await?;
+
+            conn.execute(
+                r#"
+            CREATE TABLE IF NOT EXISTS options (
+                id INTEGER PRIMARY KEY,
+                option TEXT NOT NULL,
+                is_answer BOOLEAN NOT NULL,
+                question_id INTEGER NOT NULL,
+                FOREIGN KEY(question_id) REFERENCES questions(id)
             )
                 "#,
                 (),
@@ -203,6 +243,44 @@ mod db {
 
             tracing::info!("session {session:?} exists: {exists}");
             Ok(exists)
+        }
+
+        pub async fn load_questions(&self, quiz_name: String, questions: Questions) -> Result<()> {
+            let conn = self.db.connect()?;
+            let quiz_id = conn
+                .query(
+                    "INSERT INTO quizzes (name) VALUES (?) RETURNING id",
+                    params![quiz_name],
+                )
+                .await?
+                .next()
+                .await?
+                .ok_or_eyre("could not get quiz id")?
+                .get::<i32>(0)?;
+
+            for Question { question, options } in questions {
+                let question_id = conn
+                    .query(
+                        "INSERT INTO questions (question, quiz_id) VALUES (?, ?) RETURNING id",
+                        params![question, quiz_id],
+                    )
+                    .await?
+                    .next()
+                    .await?
+                    .ok_or_eyre("could not get question id")?
+                    .get::<i32>(0)?;
+
+                for option in options {
+                    conn.execute(
+                        "INSERT INTO options (option, is_answer, question_id) VALUES (?, ?, ?)",
+                        params![option.text, option.is_answer, question_id],
+                    )
+                    .await?;
+                }
+            }
+
+            tracing::info!("new quiz created with id: {quiz_id}");
+            Ok(())
         }
     }
 }
@@ -288,12 +366,21 @@ mod views {
 }
 
 mod homepage {
-    use crate::{db::Db, names, rejections::InternalServerError, utils, views, with_state};
+    use std::collections::HashMap;
+
+    use crate::{
+        db::Db,
+        model, names,
+        rejections::{InputError, InternalServerError, Unauthorized},
+        utils, views, with_state,
+    };
 
     use maud::{html, Markup};
     use serde::Deserialize;
     use warp::{
+        filters::multipart::FormData,
         http::{header::SET_COOKIE, Response},
+        reject::Rejection,
         reply::Reply,
         Filter,
     };
@@ -319,7 +406,34 @@ mod homepage {
             .and(warp::body::json::<LoginPost>())
             .and_then(login_post);
 
-        homepage.or(get_started_post).or(login_post)
+        let create_quiz = warp::path("create-quiz")
+            .and(warp::post())
+            .and(with_authorized(conn.clone()))
+            .and(with_state(conn.clone()))
+            .and(warp::multipart::form())
+            .and_then(create_quiz);
+
+        homepage.or(get_started_post).or(login_post).or(create_quiz)
+    }
+
+    pub fn with_authorized(db: Db) -> impl Filter<Extract = ((),), Error = Rejection> + Clone {
+        warp::any()
+            .and(with_state(db.clone()))
+            .and(warp::cookie::optional::<String>(names::SESSION_COOKIE_NAME))
+            .and_then(authorized)
+    }
+
+    async fn authorized(db: Db, session: Option<String>) -> Result<(), warp::Rejection> {
+        let session_exists = match session {
+            Some(s) => db.session_exists(s).await.unwrap_or_default(),
+            None => false,
+        };
+
+        if session_exists {
+            Ok(())
+        } else {
+            Err(warp::reject::custom(Unauthorized))
+        }
     }
 
     async fn homepage(
@@ -403,6 +517,55 @@ mod homepage {
         } else {
             Ok(views::titled("Welcome Back", login(LoginState::IncorrectPassword)).into_response())
         }
+    }
+
+    async fn create_quiz(
+        _: (),
+        db: Db,
+        form: FormData,
+    ) -> Result<impl warp::Reply, warp::Rejection> {
+        use bytes::BufMut;
+        use futures_util::TryStreamExt;
+
+        let mut field_names: HashMap<_, _> = form
+            .and_then(|mut field| async move {
+                let mut bytes: Vec<u8> = Vec::new();
+
+                while let Some(content) = field.data().await {
+                    let content = content.unwrap();
+                    bytes.put(content);
+                }
+                Ok((
+                    field.name().to_string(),
+                    String::from_utf8_lossy(&*bytes).to_string(),
+                ))
+            })
+            .try_collect()
+            .await
+            .map_err(|e| {
+                tracing::error!("failed to decode form data: {e}");
+                warp::reject::custom(InputError)
+            })?;
+
+        let quiz_name = field_names
+            .remove("quiz_name")
+            .ok_or_else(|| warp::reject::custom(InputError))?;
+
+        let quiz_file = field_names
+            .remove("quiz_file")
+            .ok_or_else(|| warp::reject::custom(InputError))?;
+
+        let questions = serde_json::from_str::<model::Questions>(&quiz_file).map_err(|e| {
+            tracing::error!("failed to decode quiz file: {e}");
+            warp::reject::custom(InputError)
+        })?;
+
+        db.load_questions(quiz_name, questions).await.map_err(|e| {
+            tracing::error!("failed to decode quiz file: {e}");
+            warp::reject::custom(InputError)
+        })?;
+
+        Ok(html! { h1 { "La quiz" } })
     }
 
     fn get_started() -> Markup {
@@ -490,6 +653,39 @@ mod homepage {
     fn dashboard() -> Markup {
         html! {
             h1 { "Dashboard" }
+
+            article style="width: fit-content;" {
+                form hx-post=(names::CREATE_QUIZ_URL)
+                     hx-target="main"
+                     enctype="multipart/form-data"
+                     hx-disabled-elt="find input[type='text'], find input[type='file'], find input[type='submit']"
+                     hx-swap="innerHTML" {
+                        label {
+                            "Quiz Name"
+                            input name="quiz_name"
+                                  type="text"
+                                  required="true"
+                                  autocomplete="off"
+                                  placeholder="Quiz Name"
+                                  aria-describedby="quiz-name-helper"
+                                  aria-label="Your Quiz Name";
+                            small id="quiz-name-helper" { "What do you want to call this quiz?" }
+                        }
+
+                        label {
+                            "Quiz File"
+                            input name="quiz_file"
+                                  type="file"
+                                  required="true"
+                                  aria-describedby="quiz-file-helper"
+                                  accept="application/json"
+                                  aria-label="Your Quiz File";
+                            small id="quiz-file-helper" { "The JSON file that includes the questions in this quiz." }
+                        }
+
+                        input type="submit" value="Create";
+                }
+            }
         }
     }
 }
@@ -497,6 +693,7 @@ mod homepage {
 mod names {
     pub const GET_STARTED_URL: &str = "/start";
     pub const LOGIN_URL: &str = "/login";
+    pub const CREATE_QUIZ_URL: &str = "/create-quiz";
     pub const SESSION_COOKIE_NAME: &str = "session_id";
 }
 
@@ -505,6 +702,26 @@ mod utils {
 
     pub fn cookie(name: &str, value: &str) -> String {
         format!("{name}={value}; HttpOnly; Max-Age=3600; Secure; Path=/; SameSite=Strict")
+    }
+}
+
+mod model {
+    use serde::Deserialize;
+
+    pub type Questions = Vec<Question>;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Question {
+        pub question: String,
+        pub options: Vec<QuestionOption>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct QuestionOption {
+        pub text: String,
+        pub is_answer: bool,
     }
 }
 
@@ -531,7 +748,7 @@ mod rejections {
         };
     }
 
-    rejects!(InternalServerError);
+    rejects!(InternalServerError, Unauthorized, InputError);
 
     pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
         let code;
@@ -549,6 +766,12 @@ mod rejections {
         } else if let Some(InternalServerError) = err.find() {
             code = StatusCode::INTERNAL_SERVER_ERROR;
             message = "INTERNAL_SERVER_ERROR";
+        } else if let Some(Unauthorized) = err.find() {
+            code = StatusCode::UNAUTHORIZED;
+            message = "UNAUTHORIZED";
+        } else if let Some(InputError) = err.find() {
+            code = StatusCode::BAD_REQUEST;
+            message = "INPUT_ERROR";
         } else if err.find::<warp::reject::MethodNotAllowed>().is_some() {
             code = StatusCode::METHOD_NOT_ALLOWED;
             message = "METHOD_NOT_ALLOWED";

@@ -1490,13 +1490,16 @@ dependencies = [
 name = "quizzy"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "color-eyre",
  "futures",
+ "futures-util",
  "include_dir",
  "libsql",
  "maud",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
