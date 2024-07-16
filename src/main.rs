@@ -329,6 +329,7 @@ mod views {
     fn css() -> Markup {
         html! {
             link rel="stylesheet" href="/static/pico.min.css";
+            link rel="stylesheet" href="/static/index.css";
         }
     }
 
@@ -728,16 +729,15 @@ mod homepage {
                 }
             }
 
-            table {
-                thead {
-                    tr {
-                        th scope="col" { "Quiz" }
-                        th scope="col" { "Questions" }
-                    }
-                }
-                tbody {
-                    @for quiz in quizzes {
-                        tr { td { (quiz.name) } td { (quiz.count) } }
+            div."quiz-grid" {
+                @for quiz in quizzes {
+                    article {
+                        h3 { (quiz.name) }
+                        p { (quiz.count) " questions." }
+                        div role="group" {
+                            button { "View" }
+                            button."contrast" { "Delete" }
+                        }
                     }
                 }
             }
