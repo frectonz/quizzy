@@ -10,7 +10,7 @@ authors = ["frectonz"]
 bytes = "1.6.1"
 clap = { version = "4.5.9", features = ["derive"] }
 color-eyre = "0.6.3"
-futures-util = "0.3.30"
+futures = "0.3.30"
 include_dir = "0.7.4"
 libsql = { git = "https://github.com/tursodatabase/libsql.git", features = ["remote"] }
 maud = { version = "0.26.0", features = ["warp"] }

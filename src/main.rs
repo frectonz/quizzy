@@ -1,5 +1,6 @@
 use clap::Parser;
 use db::Db;
+use futures::future::OptionFuture;
 use warp::Filter;
 
 #[derive(Parser, Debug)]
@@ -95,11 +96,21 @@ mod statics {
     }
 }
 
+trait FutureOptionExt<T> {
+    fn to_future(self) -> OptionFuture<T>;
+}
+
+impl<T> FutureOptionExt<T> for Option<T> {
+    fn to_future(self) -> OptionFuture<T> {
+        OptionFuture::from(self)
+    }
+}
+
 mod db {
     use std::sync::Arc;
 
     use color_eyre::{eyre::OptionExt, Result};
-    use futures_util::{TryStreamExt, StreamExt, future};
+    use futures::{future, StreamExt, TryStreamExt};
     use libsql::params;
     use ulid::Ulid;
 
@@ -409,9 +420,10 @@ mod homepage {
         db::Db,
         model, names,
         rejections::{InputError, InternalServerError, Unauthorized},
-        utils, views, with_state,
+        utils, views, with_state, FutureOptionExt,
     };
 
+    use futures::FutureExt;
     use maud::{html, Markup};
     use serde::Deserialize;
     use warp::{
@@ -461,10 +473,12 @@ mod homepage {
     }
 
     async fn authorized(db: Db, session: Option<String>) -> Result<(), warp::Rejection> {
-        let session_exists = match session {
-            Some(s) => db.session_exists(s).await.unwrap_or_default(),
-            None => false,
-        };
+        let session_exists = session
+            .map(|s| db.session_exists(s).map(|res| res.ok()))
+            .to_future()
+            .await
+            .flatten()
+            .unwrap_or_default();
 
         if session_exists {
             Ok(())
@@ -477,10 +491,12 @@ mod homepage {
         db: Db,
         session: Option<String>,
     ) -> Result<impl warp::Reply, warp::Rejection> {
-        let session_exists = match session {
-            Some(s) => db.session_exists(s).await.unwrap_or_default(),
-            None => false,
-        };
+        let session_exists = session
+            .map(|s| db.session_exists(s).map(|res| res.ok()))
+            .to_future()
+            .await
+            .flatten()
+            .unwrap_or_default();
 
         if session_exists {
             Ok(views::page("Dashboard", dashboard(&db).await?))
@@ -562,7 +578,7 @@ mod homepage {
         form: FormData,
     ) -> Result<impl warp::Reply, warp::Rejection> {
         use bytes::BufMut;
-        use futures_util::TryStreamExt;
+        use futures::TryStreamExt;
 
         let mut field_names: HashMap<_, _> = form
             .and_then(|mut field| async move {
@@ -574,7 +590,7 @@ mod homepage {
                 }
                 Ok((
                     field.name().to_string(),
-                    String::from_utf8_lossy(&*bytes).to_string(),
+                    String::from_utf8_lossy(&bytes).to_string(),
                 ))
             })
             .try_collect()
