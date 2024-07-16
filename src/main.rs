@@ -99,10 +99,16 @@ mod db {
     use std::sync::Arc;
 
     use color_eyre::{eyre::OptionExt, Result};
+    use futures_util::{TryStreamExt, StreamExt, future};
     use libsql::params;
     use ulid::Ulid;
 
     use crate::model::{Question, Questions};
+
+    pub struct Quiz {
+        pub name: String,
+        pub count: i32,
+    }
 
     #[derive(Clone)]
     pub struct Db {
@@ -282,6 +288,36 @@ mod db {
             tracing::info!("new quiz created with id: {quiz_id}");
             Ok(())
         }
+
+        pub async fn quizzes(&self) -> Result<Vec<Quiz>> {
+            let conn = self.db.connect()?;
+
+            let quizzes = conn
+                .query(
+                    r#"
+            SELECT
+              quizzes.name,
+              COUNT(questions.id) AS question_count
+            FROM
+              quizzes
+              JOIN questions ON questions.quiz_id = quizzes.id
+            GROUP BY
+              quizzes.name
+                    "#,
+                    (),
+                )
+                .await?
+                .into_stream()
+                .map_ok(|r| Quiz {
+                    name: r.get::<String>(0).expect("could not get quiz name"),
+                    count: r.get::<i32>(1).expect("could not get questions count"),
+                })
+                .filter_map(|r| future::ready(r.ok()))
+                .collect::<Vec<_>>()
+                .await;
+
+            Ok(quizzes)
+        }
     }
 }
 
@@ -446,7 +482,7 @@ mod homepage {
         };
 
         if session_exists {
-            Ok(views::page("Dashboard", dashboard()))
+            Ok(views::page("Dashboard", dashboard(&db).await?))
         } else {
             let admin_password = db.admin_password().await.map_err(|e| {
                 tracing::error!("could not get admin password: {e}");
@@ -484,7 +520,7 @@ mod homepage {
         let cookie = utils::cookie(names::SESSION_COOKIE_NAME, &session);
         let resp = Response::builder()
             .header(SET_COOKIE, cookie)
-            .body(views::titled("Dashboard", dashboard()).into_string())
+            .body(views::titled("Dashboard", dashboard(&db).await?).into_string())
             .unwrap();
 
         Ok(resp)
@@ -510,7 +546,7 @@ mod homepage {
             let cookie = utils::cookie(names::SESSION_COOKIE_NAME, &session);
             let resp = Response::builder()
                 .header(SET_COOKIE, cookie)
-                .body(views::titled("Dashboard", dashboard()).into_string())
+                .body(views::titled("Dashboard", dashboard(&db).await?).into_string())
                 .unwrap();
 
             Ok(resp.into_response())
@@ -650,8 +686,13 @@ mod homepage {
         }
     }
 
-    fn dashboard() -> Markup {
-        html! {
+    async fn dashboard(db: &Db) -> Result<Markup, Rejection> {
+        let quizzes = db.quizzes().await.map_err(|e| {
+            tracing::error!("could not get quizzes from database: {e}");
+            warp::reject::custom(InternalServerError)
+        })?;
+
+        let page = html! {
             h1 { "Dashboard" }
 
             article style="width: fit-content;" {
@@ -686,7 +727,23 @@ mod homepage {
                         input type="submit" value="Create";
                 }
             }
-        }
+
+            table {
+                thead {
+                    tr {
+                        th scope="col" { "Quiz" }
+                        th scope="col" { "Questions" }
+                    }
+                }
+                tbody {
+                    @for quiz in quizzes {
+                        tr { td { (quiz.name) } td { (quiz.count) } }
+                    }
+                }
+            }
+        };
+
+        Ok(page)
     }
 }
 

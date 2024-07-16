@@ -1493,7 +1493,6 @@ dependencies = [
  "bytes",
  "clap",
  "color-eyre",
- "futures",
  "futures-util",
  "include_dir",
  "libsql",
