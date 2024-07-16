@@ -117,6 +117,7 @@ mod db {
     use crate::model::{Question, Questions};
 
     pub struct Quiz {
+        pub id: i32,
         pub name: String,
         pub count: i32,
     }
@@ -180,7 +181,7 @@ mod db {
                 id INTEGER PRIMARY KEY,
                 question TEXT NOT NULL,
                 quiz_id INTEGER NOT NULL,
-                FOREIGN KEY(quiz_id) REFERENCES quizzes(id)
+                FOREIGN KEY(quiz_id) REFERENCES quizzes(id) ON DELETE CASCADE
             )
                 "#,
                 (),
@@ -194,7 +195,7 @@ mod db {
                 option TEXT NOT NULL,
                 is_answer BOOLEAN NOT NULL,
                 question_id INTEGER NOT NULL,
-                FOREIGN KEY(question_id) REFERENCES questions(id)
+                FOREIGN KEY(question_id) REFERENCES questions(id) ON DELETE CASCADE
             )
                 "#,
                 (),
@@ -262,7 +263,7 @@ mod db {
             Ok(exists)
         }
 
-        pub async fn load_questions(&self, quiz_name: String, questions: Questions) -> Result<()> {
+        pub async fn load_quiz(&self, quiz_name: String, questions: Questions) -> Result<()> {
             let conn = self.db.connect()?;
             let quiz_id = conn
                 .query(
@@ -307,6 +308,7 @@ mod db {
                 .query(
                     r#"
             SELECT
+              quizzes.id,
               quizzes.name,
               COUNT(questions.id) AS question_count
             FROM
@@ -320,14 +322,25 @@ mod db {
                 .await?
                 .into_stream()
                 .map_ok(|r| Quiz {
-                    name: r.get::<String>(0).expect("could not get quiz name"),
-                    count: r.get::<i32>(1).expect("could not get questions count"),
+                    id: r.get::<i32>(0).expect("could not get quiz id"),
+                    name: r.get::<String>(1).expect("could not get quiz name"),
+                    count: r.get::<i32>(2).expect("could not get questions count"),
                 })
                 .filter_map(|r| future::ready(r.ok()))
                 .collect::<Vec<_>>()
                 .await;
 
             Ok(quizzes)
+        }
+
+        pub async fn delete_quiz(&self, quiz_id: i32) -> Result<()> {
+            let conn = self.db.connect()?;
+
+            conn.execute("DELETE FROM quizzes WHERE id = ?", params![quiz_id])
+                .await?;
+
+            tracing::info!("quiz deleted with id: {quiz_id}");
+            Ok(())
         }
     }
 }
@@ -462,7 +475,17 @@ mod homepage {
             .and(warp::multipart::form())
             .and_then(create_quiz);
 
-        homepage.or(get_started_post).or(login_post).or(create_quiz)
+        let delete_quiz = with_authorized(conn.clone())
+            .and(with_state(conn.clone()))
+            .and(warp::delete())
+            .and(warp::path!("delete-quiz" / i32))
+            .and_then(delete_quiz);
+
+        homepage
+            .or(get_started_post)
+            .or(login_post)
+            .or(create_quiz)
+            .or(delete_quiz)
     }
 
     pub fn with_authorized(db: Db) -> impl Filter<Extract = ((),), Error = Rejection> + Clone {
@@ -613,12 +636,21 @@ mod homepage {
             warp::reject::custom(InputError)
         })?;
 
-        db.load_questions(quiz_name, questions).await.map_err(|e| {
+        db.load_quiz(quiz_name, questions).await.map_err(|e| {
             tracing::error!("failed to decode quiz file: {e}");
             warp::reject::custom(InputError)
         })?;
 
         Ok(html! { h1 { "La quiz" } })
+    }
+
+    async fn delete_quiz(_: (), db: Db, quiz_id: i32) -> Result<impl warp::Reply, warp::Rejection> {
+        db.delete_quiz(quiz_id).await.map_err(|e| {
+            tracing::error!("failed to delete a quiz: {e}");
+            warp::reject::custom(InternalServerError)
+        })?;
+
+        Ok(html!())
     }
 
     fn get_started() -> Markup {
@@ -680,7 +712,9 @@ mod homepage {
                                       placeholder="Admin Password"
                                       aria-describedby="password-helper"
                                       aria-label="Your Password";
-                                small id="password-helper" { "Use the admin password you set when you first used Quizzy." }
+                                small id="password-helper" {
+                                    "Use the admin password you set when you first used Quizzy."
+                                }
                             }
                         },
                         LoginState::IncorrectPassword => {
@@ -752,7 +786,13 @@ mod homepage {
                         p { (quiz.count) " questions." }
                         div role="group" {
                             button { "View" }
-                            button."contrast" { "Delete" }
+                            button."contrast"
+                                hx-disabled-elt="this"
+                                hx-trigger="click"
+                                hx-target="closest article"
+                                hx-swap="outerHTML"
+                                hx-confirm="Are you sure you want to delete this Quiz?"
+                                hx-delete=(names::delete_quiz_url(quiz.id)) { "Delete" }
                         }
                     }
                 }
@@ -768,6 +808,10 @@ mod names {
     pub const LOGIN_URL: &str = "/login";
     pub const CREATE_QUIZ_URL: &str = "/create-quiz";
     pub const SESSION_COOKIE_NAME: &str = "session_id";
+
+    pub fn delete_quiz_url(quiz_id: i32) -> String {
+        format!("/delete-quiz/{quiz_id}")
+    }
 }
 
 mod utils {
