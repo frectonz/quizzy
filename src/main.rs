@@ -202,6 +202,38 @@ mod db {
             )
             .await?;
 
+            conn.execute(
+                r#"
+            CREATE TABLE IF NOT EXISTS submissions (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                cookie TEXT NOT NULL,
+                question_idx INTEGER,
+                quiz_id INTEGER NOT NULL,
+                FOREIGN KEY(quiz_id) REFERENCES quizzes(id) ON DELETE CASCADE
+            )
+                "#,
+                (),
+            )
+            .await?;
+
+            conn.execute(
+                r#"
+            CREATE TABLE IF NOT EXISTS answers (
+                id INTEGER PRIMARY KEY,
+                is_correct BOOLEAN NOT NULL,
+                answer_id INTEGER NOT NULL,
+                question_id INTEGER NOT NULL,
+                submission_id INTEGER NOT NULL,
+                FOREIGN KEY(answer_id) REFERENCES options(id) ON DELETE CASCADE,
+                FOREIGN KEY(question_id) REFERENCES questions(id) ON DELETE CASCADE,
+                FOREIGN KEY(submission_id) REFERENCES submissions(id) ON DELETE CASCADE
+            )
+                "#,
+                (),
+            )
+            .await?;
+
             tracing::info!("database connection has been verified");
 
             Ok(Self { db: Arc::new(db) })
@@ -355,6 +387,22 @@ mod db {
                 .get::<String>(0)?;
 
             Ok(quiz_name)
+        }
+
+        pub async fn create_submission(&self, name: &str, quiz_id: i32) -> Result<String> {
+            let cookie = Ulid::new().to_string();
+            let cookie_str = cookie.as_str();
+            let conn = self.db.connect()?;
+
+            let rows = conn
+                .execute(
+                    "INSERT INTO submissions (name, cookie, quiz_id, question_idx) VALUES (?, ?, ?, 0)",
+                    params![name, cookie_str, quiz_id],
+                )
+                .await?;
+
+            tracing::info!("submission created for quiz={quiz_id}: {rows:?}");
+            Ok(cookie)
         }
     }
 }
@@ -665,7 +713,7 @@ mod homepage {
 
         let resp = Response::builder()
             .header("HX-Replace-Url", names::quiz_dashboard_url(quiz_id))
-            .body(views::titled("Quiz", quiz::page(&db, quiz_id).await?).into_string())
+            .body(views::titled("Quiz", quiz::dashboard(&db, quiz_id).await?).into_string())
             .unwrap();
 
         Ok(resp)
@@ -837,21 +885,46 @@ mod homepage {
 
 mod quiz {
     use maud::{html, Markup};
-    use warp::{reject::Rejection, Filter};
+    use serde::Deserialize;
+    use warp::{
+        http::{header::SET_COOKIE, Response},
+        reject::Rejection,
+        Filter,
+    };
 
     use crate::{
-        db::Db, is_authorized, is_htmx, rejections::InternalServerError, views, with_state,
+        db::Db, is_authorized, is_htmx, names, rejections::InternalServerError, utils, views,
+        with_state,
     };
+
+    #[derive(Deserialize)]
+    struct StartSubmissionBody {
+        name: String,
+    }
 
     pub fn route(
         conn: Db,
     ) -> impl warp::Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
-        is_authorized(conn.clone())
+        let quiz_dashboard = is_authorized(conn.clone())
             .and(is_htmx())
             .and(with_state(conn.clone()))
             .and(warp::get())
             .and(warp::path!("quiz" / i32 / "dashboard"))
-            .and_then(quiz_dashboard)
+            .and_then(quiz_dashboard);
+
+        let quiz_page = warp::get()
+            .and(is_htmx())
+            .and(with_state(conn.clone()))
+            .and(warp::path!("quiz" / i32))
+            .and_then(quiz_page);
+
+        let start_submission = warp::post()
+            .and(with_state(conn.clone()))
+            .and(warp::path!("start-submission" / i32))
+            .and(warp::body::json::<StartSubmissionBody>())
+            .and_then(start_submission);
+
+        quiz_dashboard.or(quiz_page).or(start_submission)
     }
 
     async fn quiz_dashboard(
@@ -861,13 +934,88 @@ mod quiz {
         quiz_id: i32,
     ) -> Result<impl warp::Reply, warp::Rejection> {
         Ok(if is_htmx {
-            views::titled("Quiz", page(&db, quiz_id).await?)
+            views::titled("Quiz", dashboard(&db, quiz_id).await?)
         } else {
-            views::page("Quiz", page(&db, quiz_id).await?)
+            views::page("Quiz", dashboard(&db, quiz_id).await?)
         })
     }
 
+    async fn start_submission(
+        db: Db,
+        quiz_id: i32,
+        body: StartSubmissionBody,
+    ) -> Result<impl warp::Reply, warp::Rejection> {
+        let sumission_cookie = db
+            .create_submission(&body.name, quiz_id)
+            .await
+            .map_err(|e| {
+                tracing::error!("could not get quiz name for {quiz_id}: {e}");
+                warp::reject::custom(InternalServerError)
+            })?;
+
+        let page = views::titled("Quiz", html! { h1 { "Submission started" } });
+
+        let cookie = utils::cookie(names::SUBMISSION_COOKIE_NAME, &sumission_cookie);
+        let resp = Response::builder()
+            .header(SET_COOKIE, cookie)
+            .body(page.into_string())
+            .unwrap();
+
+        Ok(resp)
+    }
+
+    async fn quiz_page(
+        is_htmx: bool,
+        db: Db,
+        quiz_id: i32,
+    ) -> Result<impl warp::Reply, warp::Rejection> {
+        let page = page(&db, quiz_id).await?;
+
+        if is_htmx {
+            Ok(views::titled("Quiz", page))
+        } else {
+            Ok(views::page("Quiz", page))
+        }
+    }
+
     pub async fn page(db: &Db, quiz_id: i32) -> Result<Markup, Rejection> {
+        let quiz_name = db.quiz_name(quiz_id).await.map_err(|e| {
+            tracing::error!("could not get quiz name for {quiz_id}: {e}");
+            warp::reject::custom(InternalServerError)
+        })?;
+
+        Ok(html! {
+            h1 { "Welcome to Quizzy!" }
+            p {
+                "You are going to be doing the quiz "
+                mark { (quiz_name) }
+                ", but before you get started we need "
+                strong { "your name" }
+                " to identify you."
+            }
+            article style="width: fit-content;" {
+                form hx-post=(names::start_submission_url(quiz_id))
+                     hx-ext="json-enc"
+                     hx-target="main"
+                     hx-disabled-elt="find input[type='text'], find input[type='submit']"
+                     hx-swap="innerHTML" {
+                    label {
+                        "Your Name"
+                        input name="name"
+                              type="text"
+                              autocomplete="off"
+                              placeholder="Your Name"
+                              aria-describedby="name-helper"
+                              aria-label="Your Name";
+                        small id="name-helper" { "The quiz admin will be able to see your name." }
+                    }
+                    input type="submit" value="Get Started";
+                }
+            }
+        })
+    }
+
+    pub async fn dashboard(db: &Db, quiz_id: i32) -> Result<Markup, Rejection> {
         let quiz_name = db.quiz_name(quiz_id).await.map_err(|e| {
             tracing::error!("could not get quiz name from database: {e}");
             warp::reject::custom(InternalServerError)
@@ -888,10 +1036,12 @@ mod quiz {
 }
 
 mod names {
-    pub const GET_STARTED_URL: &str = "/start";
     pub const LOGIN_URL: &str = "/login";
+    pub const GET_STARTED_URL: &str = "/start";
     pub const CREATE_QUIZ_URL: &str = "/create-quiz";
+
     pub const SESSION_COOKIE_NAME: &str = "session_id";
+    pub const SUBMISSION_COOKIE_NAME: &str = "submission";
 
     pub fn quiz_dashboard_url(quiz_id: i32) -> String {
         format!("/quiz/{quiz_id}/dashboard")
@@ -899,6 +1049,10 @@ mod names {
 
     pub fn delete_quiz_url(quiz_id: i32) -> String {
         format!("/delete-quiz/{quiz_id}")
+    }
+
+    pub fn start_submission_url(quiz_id: i32) -> String {
+        format!("/start-submission/{quiz_id}")
     }
 }
 
