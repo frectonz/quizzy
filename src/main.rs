@@ -1,6 +1,6 @@
 use clap::Parser;
 use db::Db;
-use futures::future::OptionFuture;
+use futures::{future::OptionFuture, FutureExt};
 use warp::Filter;
 
 #[derive(Parser, Debug)]
@@ -46,7 +46,7 @@ async fn main() -> color_eyre::Result<()> {
 pub fn routes(
     conn: db::Db,
 ) -> impl warp::Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
-    homepage::route(conn.clone())
+    homepage::route(conn.clone()).or(quiz::route(conn.clone()))
 }
 
 fn with_state<T: Clone + Send>(
@@ -263,7 +263,7 @@ mod db {
             Ok(exists)
         }
 
-        pub async fn load_quiz(&self, quiz_name: String, questions: Questions) -> Result<()> {
+        pub async fn load_quiz(&self, quiz_name: String, questions: Questions) -> Result<i32> {
             let conn = self.db.connect()?;
             let quiz_id = conn
                 .query(
@@ -298,7 +298,7 @@ mod db {
             }
 
             tracing::info!("new quiz created with id: {quiz_id}");
-            Ok(())
+            Ok(quiz_id)
         }
 
         pub async fn quizzes(&self) -> Result<Vec<Quiz>> {
@@ -341,6 +341,20 @@ mod db {
 
             tracing::info!("quiz deleted with id: {quiz_id}");
             Ok(())
+        }
+
+        pub async fn quiz_name(&self, quiz_id: i32) -> Result<String> {
+            let conn = self.db.connect()?;
+
+            let quiz_name = conn
+                .query("SELECT name FROM quizzes WHERE id = ?", params![quiz_id])
+                .await?
+                .next()
+                .await?
+                .ok_or_eyre("could not get quiz name")?
+                .get::<String>(0)?;
+
+            Ok(quiz_name)
         }
     }
 }
@@ -426,13 +440,43 @@ mod views {
     }
 }
 
+pub fn is_authorized(
+    db: Db,
+) -> impl Filter<Extract = ((),), Error = warp::reject::Rejection> + Clone {
+    warp::any()
+        .and(with_state(db.clone()))
+        .and(warp::cookie::optional::<String>(names::SESSION_COOKIE_NAME))
+        .and_then(authorized)
+}
+
+async fn authorized(db: Db, session: Option<String>) -> Result<(), warp::Rejection> {
+    let session_exists = session
+        .map(|s| db.session_exists(s).map(|res| res.ok()))
+        .to_future()
+        .await
+        .flatten()
+        .unwrap_or_default();
+
+    if session_exists {
+        Ok(())
+    } else {
+        Err(warp::reject::custom(rejections::Unauthorized))
+    }
+}
+
+pub fn is_htmx() -> impl Filter<Extract = (bool,), Error = warp::reject::Rejection> + Clone {
+    warp::any()
+        .and(warp::header::optional::<String>("HX-Request"))
+        .map(|hx_req: Option<String>| hx_req.is_some_and(|x| x == "true"))
+}
+
 mod homepage {
     use std::collections::HashMap;
 
     use crate::{
         db::Db,
-        model, names,
-        rejections::{InputError, InternalServerError, Unauthorized},
+        is_authorized, model, names, quiz,
+        rejections::{InputError, InternalServerError},
         utils, views, with_state, FutureOptionExt,
     };
 
@@ -470,12 +514,12 @@ mod homepage {
 
         let create_quiz = warp::path("create-quiz")
             .and(warp::post())
-            .and(with_authorized(conn.clone()))
+            .and(is_authorized(conn.clone()))
             .and(with_state(conn.clone()))
             .and(warp::multipart::form())
             .and_then(create_quiz);
 
-        let delete_quiz = with_authorized(conn.clone())
+        let delete_quiz = is_authorized(conn.clone())
             .and(with_state(conn.clone()))
             .and(warp::delete())
             .and(warp::path!("delete-quiz" / i32))
@@ -486,28 +530,6 @@ mod homepage {
             .or(login_post)
             .or(create_quiz)
             .or(delete_quiz)
-    }
-
-    pub fn with_authorized(db: Db) -> impl Filter<Extract = ((),), Error = Rejection> + Clone {
-        warp::any()
-            .and(with_state(db.clone()))
-            .and(warp::cookie::optional::<String>(names::SESSION_COOKIE_NAME))
-            .and_then(authorized)
-    }
-
-    async fn authorized(db: Db, session: Option<String>) -> Result<(), warp::Rejection> {
-        let session_exists = session
-            .map(|s| db.session_exists(s).map(|res| res.ok()))
-            .to_future()
-            .await
-            .flatten()
-            .unwrap_or_default();
-
-        if session_exists {
-            Ok(())
-        } else {
-            Err(warp::reject::custom(Unauthorized))
-        }
     }
 
     async fn homepage(
@@ -636,12 +658,17 @@ mod homepage {
             warp::reject::custom(InputError)
         })?;
 
-        db.load_quiz(quiz_name, questions).await.map_err(|e| {
+        let quiz_id = db.load_quiz(quiz_name, questions).await.map_err(|e| {
             tracing::error!("failed to decode quiz file: {e}");
             warp::reject::custom(InputError)
         })?;
 
-        Ok(html! { h1 { "La quiz" } })
+        let resp = Response::builder()
+            .header("HX-Replace-Url", names::quiz_dashboard_url(quiz_id))
+            .body(views::titled("Quiz", quiz::page(&db, quiz_id).await?).into_string())
+            .unwrap();
+
+        Ok(resp)
     }
 
     async fn delete_quiz(_: (), db: Db, quiz_id: i32) -> Result<impl warp::Reply, warp::Rejection> {
@@ -785,7 +812,12 @@ mod homepage {
                         h3 { (quiz.name) }
                         p { (quiz.count) " questions." }
                         div role="group" {
-                            button { "View" }
+                            button
+                                hx-trigger="click"
+                                hx-target="main"
+                                hx-swap="innerHTML"
+                                hx-push-url="true"
+                                hx-get=(names::quiz_dashboard_url(quiz.id)) { "View" }
                             button."contrast"
                                 hx-disabled-elt="this"
                                 hx-trigger="click"
@@ -803,11 +835,67 @@ mod homepage {
     }
 }
 
+mod quiz {
+    use maud::{html, Markup};
+    use warp::{reject::Rejection, Filter};
+
+    use crate::{
+        db::Db, is_authorized, is_htmx, rejections::InternalServerError, views, with_state,
+    };
+
+    pub fn route(
+        conn: Db,
+    ) -> impl warp::Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
+        is_authorized(conn.clone())
+            .and(is_htmx())
+            .and(with_state(conn.clone()))
+            .and(warp::get())
+            .and(warp::path!("quiz" / i32 / "dashboard"))
+            .and_then(quiz_dashboard)
+    }
+
+    async fn quiz_dashboard(
+        _: (),
+        is_htmx: bool,
+        db: Db,
+        quiz_id: i32,
+    ) -> Result<impl warp::Reply, warp::Rejection> {
+        Ok(if is_htmx {
+            views::titled("Quiz", page(&db, quiz_id).await?)
+        } else {
+            views::page("Quiz", page(&db, quiz_id).await?)
+        })
+    }
+
+    pub async fn page(db: &Db, quiz_id: i32) -> Result<Markup, Rejection> {
+        let quiz_name = db.quiz_name(quiz_id).await.map_err(|e| {
+            tracing::error!("could not get quiz name from database: {e}");
+            warp::reject::custom(InternalServerError)
+        })?;
+
+        Ok(html! {
+            h1 { (quiz_name) }
+            p { "Dashboard for quiz number " (quiz_id) "." }
+            article style="width: fit-content;" {
+                h4 { "Share this link to people so that they can do the quiz." }
+                p id="url" { "" }
+                script {
+                    "document.querySelector('#url').textContent = `${window.location.origin}/quiz/" (quiz_id) "`;"
+                }
+            }
+        })
+    }
+}
+
 mod names {
     pub const GET_STARTED_URL: &str = "/start";
     pub const LOGIN_URL: &str = "/login";
     pub const CREATE_QUIZ_URL: &str = "/create-quiz";
     pub const SESSION_COOKIE_NAME: &str = "session_id";
+
+    pub fn quiz_dashboard_url(quiz_id: i32) -> String {
+        format!("/quiz/{quiz_id}/dashboard")
+    }
 
     pub fn delete_quiz_url(quiz_id: i32) -> String {
         format!("/delete-quiz/{quiz_id}")
