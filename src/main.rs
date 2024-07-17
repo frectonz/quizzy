@@ -408,7 +408,7 @@ mod db {
 }
 
 mod views {
-    use maud::{html, Markup, PreEscaped, DOCTYPE};
+    use maud::{html, Markup, DOCTYPE};
 
     use crate::utils;
 
@@ -482,8 +482,8 @@ mod views {
 
     pub fn titled(title: &str, body: Markup) -> Markup {
         html! {
+            title { (title) " - Quizzy" }
             (body)
-            (PreEscaped(format!("<script>document.title = `{title} - Quizzy`;</script>")))
         }
     }
 }
@@ -713,7 +713,9 @@ mod homepage {
 
         let resp = Response::builder()
             .header("HX-Replace-Url", names::quiz_dashboard_url(quiz_id))
-            .body(views::titled("Quiz", quiz::dashboard(&db, quiz_id).await?).into_string())
+            .body(
+                views::titled("Quiz Dashboard", quiz::dashboard(&db, quiz_id).await?).into_string(),
+            )
             .unwrap();
 
         Ok(resp)
@@ -934,9 +936,9 @@ mod quiz {
         quiz_id: i32,
     ) -> Result<impl warp::Reply, warp::Rejection> {
         Ok(if is_htmx {
-            views::titled("Quiz", dashboard(&db, quiz_id).await?)
+            views::titled("Quiz Dashboard", dashboard(&db, quiz_id).await?)
         } else {
-            views::page("Quiz", dashboard(&db, quiz_id).await?)
+            views::page("Quiz Dashboard", dashboard(&db, quiz_id).await?)
         })
     }
 
