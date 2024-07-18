@@ -122,6 +122,21 @@ mod db {
         pub count: i32,
     }
 
+    pub struct QuestionModel {
+        pub question: String,
+        pub options: Vec<QuestionOptionModel>,
+    }
+
+    pub struct QuestionOptionModel {
+        pub id: i32,
+        pub option: String,
+    }
+
+    pub struct SubmissionModel {
+        pub quiz_id: i32,
+        pub question_idx: i32,
+    }
+
     #[derive(Clone)]
     pub struct Db {
         db: Arc<libsql::Database>,
@@ -403,6 +418,85 @@ mod db {
 
             tracing::info!("submission created for quiz={quiz_id}: {rows:?}");
             Ok(cookie)
+        }
+
+        pub async fn get_question(&self, question_id: i32) -> Result<QuestionModel> {
+            let conn = self.db.connect()?;
+
+            let question = conn
+                .query(
+                    "SELECT question FROM questions WHERE id = ?",
+                    params![question_id],
+                )
+                .await?
+                .next()
+                .await?
+                .ok_or_eyre("could not get quiz name")?
+                .get::<String>(0)?;
+
+            let options = conn
+                .query(
+                    "SELECT id, option FROM options WHERE question_id = ?",
+                    params![question_id],
+                )
+                .await?
+                .into_stream()
+                .map_ok(|r| QuestionOptionModel {
+                    id: r.get::<i32>(0).expect("could not get option id"),
+                    option: r.get::<String>(1).expect("could not get option"),
+                })
+                .filter_map(|r| future::ready(r.ok()))
+                .collect::<Vec<_>>()
+                .await;
+
+            Ok(QuestionModel { question, options })
+        }
+
+        pub async fn question_id_from_idx(&self, quiz_id: i32, question_idx: i32) -> Result<i32> {
+            let conn = self.db.connect()?;
+            let question_id = conn
+                .query(
+                    "SELECT id FROM questions WHERE quiz_id = ? LIMIT 1 OFFSET ?",
+                    params![quiz_id, question_idx],
+                )
+                .await?
+                .next()
+                .await?
+                .ok_or_eyre("no question id found")?
+                .get::<i32>(0)?;
+
+            Ok(question_id)
+        }
+
+        pub async fn questions_count(&self, quiz_id: i32) -> Result<i32> {
+            let conn = self.db.connect()?;
+            Ok(conn
+                .query(
+                    "SELECT count(*) FROM questions WHERE quiz_id = ?",
+                    params![quiz_id],
+                )
+                .await?
+                .next()
+                .await?
+                .ok_or_eyre("could not get questions count")?
+                .get::<i32>(0)?)
+        }
+
+        pub async fn get_submission(&self, cookie: &str) -> Result<SubmissionModel> {
+            let conn = self.db.connect()?;
+            Ok(conn
+                .query(
+                    "SELECT quiz_id, question_idx FROM submissions WHERE cookie = ?",
+                    params![cookie],
+                )
+                .await?
+                .next()
+                .await?
+                .map(|r| SubmissionModel {
+                    quiz_id: r.get::<i32>(0).expect("failed to get quiz id"),
+                    question_idx: r.get::<i32>(1).expect("failed to get question index"),
+                })
+                .ok_or_eyre("could not get submission")?)
         }
     }
 }
@@ -918,6 +1012,7 @@ mod quiz {
             .and(is_htmx())
             .and(with_state(conn.clone()))
             .and(warp::path!("quiz" / i32))
+            .and(warp::cookie::optional(&names::SUBMISSION_COOKIE_NAME))
             .and_then(quiz_page);
 
         let start_submission = warp::post()
@@ -951,12 +1046,16 @@ mod quiz {
             .create_submission(&body.name, quiz_id)
             .await
             .map_err(|e| {
-                tracing::error!("could not get quiz name for {quiz_id}: {e}");
+                tracing::error!("could not get quiz name for quiz={quiz_id}: {e}");
                 warp::reject::custom(InternalServerError)
             })?;
 
-        let page = views::titled("Quiz", html! { h1 { "Submission started" } });
+        let quiz_name = db.quiz_name(quiz_id).await.map_err(|e| {
+            tracing::error!("could not get quiz name for quiz={quiz_id}: {e}");
+            warp::reject::custom(InternalServerError)
+        })?;
 
+        let page = views::titled(&quiz_name, question(&db, quiz_id, 0).await?);
         let cookie = utils::cookie(names::SUBMISSION_COOKIE_NAME, &sumission_cookie);
         let resp = Response::builder()
             .header(SET_COOKIE, cookie)
@@ -970,14 +1069,75 @@ mod quiz {
         is_htmx: bool,
         db: Db,
         quiz_id: i32,
+        submission: Option<String>,
     ) -> Result<impl warp::Reply, warp::Rejection> {
-        let page = page(&db, quiz_id).await?;
+        let page = match submission {
+            Some(submission) => {
+                let submission = db.get_submission(&submission).await.map_err(|e| {
+                    tracing::error!("could not get submission for {submission}: {e}");
+                    warp::reject::custom(InternalServerError)
+                })?;
+                question(&db, submission.quiz_id, submission.question_idx).await?
+            }
+            None => page(&db, quiz_id).await?,
+        };
 
         if is_htmx {
             Ok(views::titled("Quiz", page))
         } else {
             Ok(views::page("Quiz", page))
         }
+    }
+
+    pub async fn question(db: &Db, quiz_id: i32, question_idx: i32) -> Result<Markup, Rejection> {
+        let quiz_name = db.quiz_name(quiz_id).await.map_err(|e| {
+            tracing::error!("could not get quiz name for quiz={quiz_id}: {e}");
+            warp::reject::custom(InternalServerError)
+        })?;
+
+        let question_id = db
+            .question_id_from_idx(quiz_id, question_idx)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                "could not get question id for question_idx={question_idx} on quiz={quiz_id}: {e}"
+            );
+                warp::reject::custom(InternalServerError)
+            })?;
+
+        let question = db.get_question(question_id).await.map_err(|e| {
+            tracing::error!("could not get question with id={question_id}: {e}");
+            warp::reject::custom(InternalServerError)
+        })?;
+
+        let questions_count = db.questions_count(quiz_id).await.map_err(|e| {
+            tracing::error!("could not get question cout for quiz_id={quiz_id}: {e}");
+            warp::reject::custom(InternalServerError)
+        })?;
+
+        Ok(html! {
+            p { "You are doing the quiz " mark { (quiz_name) } "." }
+            article style="width: fit-content;" {
+                h1 { (question.question) }
+                p { "Question " (question_idx + 1) " of " (questions_count) "."  }
+
+                form hx-post=(names::SUBMIT_ANSWER_URL)
+                     hx-ext="json-enc"
+                     hx-target="main"
+                     hx-disabled-elt="find input[type='radio'], find input[type='submit']"
+                     hx-swap="innerHTML" {
+                    fieldset {
+                        @for option in question.options {
+                            label {
+                                input type="radio" name="option" value=(option.id);
+                                (option.option)
+                            }
+                        }
+                    }
+                    input type="submit" value="Submit";
+                }
+            }
+        })
     }
 
     pub async fn page(db: &Db, quiz_id: i32) -> Result<Markup, Rejection> {
@@ -1041,6 +1201,7 @@ mod names {
     pub const LOGIN_URL: &str = "/login";
     pub const GET_STARTED_URL: &str = "/start";
     pub const CREATE_QUIZ_URL: &str = "/create-quiz";
+    pub const SUBMIT_ANSWER_URL: &str = "/create-quiz";
 
     pub const SESSION_COOKIE_NAME: &str = "session_id";
     pub const SUBMISSION_COOKIE_NAME: &str = "submission";
