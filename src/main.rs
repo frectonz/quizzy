@@ -1142,11 +1142,17 @@ mod quiz {
     ) -> Result<impl warp::Reply, warp::Rejection> {
         let page = match submission {
             Some(submission) => {
-                let submission = db.get_submission(&submission).await.map_err(|e| {
-                    tracing::error!("could not get submission for {submission}: {e}");
-                    warp::reject::custom(InternalServerError)
-                })?;
-                question(&db, submission.quiz_id, submission.question_idx).await?
+                let res = db.get_submission(&submission).await;
+
+                match res {
+                    Ok(submission) => {
+                        question(&db, submission.quiz_id, submission.question_idx).await?
+                    }
+                    Err(e) => {
+                        tracing::error!("could not get submission for {submission}: {e}");
+                        page(&db, quiz_id).await?
+                    }
+                }
             }
             None => page(&db, quiz_id).await?,
         };
@@ -1185,14 +1191,38 @@ mod quiz {
             warp::reject::custom(InternalServerError)
         })?;
 
-        db.increase_question_index(submission.id)
-            .await
-            .map_err(|e| {
-                tracing::error!("could not increase question index for {cookie}: {e}");
-                warp::reject::custom(InternalServerError)
-            })?;
+        let questions_count = db.questions_count(submission.quiz_id).await.map_err(|e| {
+            tracing::error!(
+                "could not get question cout for quiz_id={}: {e}",
+                submission.quiz_id
+            );
+            warp::reject::custom(InternalServerError)
+        })?;
 
-        answer(&db, submission.quiz_id, submission.question_idx, answer_id).await
+        let is_final = submission.question_idx + 1 == questions_count;
+
+        if !is_final {
+            db.increase_question_index(submission.id)
+                .await
+                .map_err(|e| {
+                    tracing::error!("could not increase question index for {cookie}: {e}");
+                    warp::reject::custom(InternalServerError)
+                })?;
+        }
+
+        let page = answer(&db, submission.quiz_id, submission.question_idx, answer_id).await?;
+
+        let resp = if is_final {
+            let cookie = utils::cookie(names::SUBMISSION_COOKIE_NAME, "");
+            Response::builder()
+                .header(SET_COOKIE, cookie)
+                .body(page.into_string())
+                .unwrap()
+        } else {
+            Response::builder().body(page.into_string()).unwrap()
+        };
+
+        Ok(resp)
     }
 
     pub async fn question(db: &Db, quiz_id: i32, question_idx: i32) -> Result<Markup, Rejection> {
