@@ -2,6 +2,37 @@
 
 A simple dockerized self hostable quiz app which use a `libSQL` database from [Turso](https://turso.tech/).
 
+One thing that makes `quizzy` special is quizzes are imported not through inputs and forms but from one JSON file that has all the questions. Here's an example of a quiz with 3 questions from the book 1984.
+
+```json
+[
+  {
+    "question": "What is the uniform of the party?",
+    "options": [
+      { "text": "Green Overalls", "isAnswer": false },
+      { "text": "Blue Overall", "isAnswer": true },
+      { "text": "Yellow Overalls", "isAnswer": false }
+    ]
+  },
+  {
+    "question": "What is the language of Oceania?",
+    "options": [
+      { "text": "Newspeak", "isAnswer": true },
+      { "text": "Oldspeak", "isAnswer": false },
+      { "text": "OceaniaSpeak", "isAnswer": false }
+    ]
+  },
+  {
+    "question": "What happens to people accused of Thoughtcrime?",
+    "options": [
+      { "text": "KILLED", "isAnswer": false },
+      { "text": "BOILED", "isAnswer": false },
+      { "text": "VAPORIZED", "isAnswer": true }
+    ]
+  }
+]
+```
+
 ## Technologies
 
 - [PicoCSS](https://picocss.com)
