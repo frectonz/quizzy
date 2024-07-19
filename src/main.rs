@@ -7,13 +7,15 @@ use warp::Filter;
 #[command(version, about)]
 struct Args {
     /// libSQL server address
+    #[clap(env)]
     url: String,
 
     /// libSQL authentication token.
+    #[clap(env)]
     auth_token: String,
 
     /// The address to bind to.
-    #[arg(short, long, default_value = "127.0.0.1:1414")]
+    #[arg(short, long, env, default_value = "127.0.0.1:1414")]
     address: String,
 }
 
