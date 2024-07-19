@@ -1,8 +1,8 @@
 # quizzy
 
-A simple dockerized self hostable quiz app which use a `libSQL` database from [Turso](https://turso.tech/).
+A simple dockerized configurable self-hostable quiz app that uses a `libSQL` database from [Turso](https://turso.tech/).
 
-One thing that makes `quizzy` special is quizzes are imported not through inputs and forms but from one JSON file that has all the questions. Here's an example of a quiz with 3 questions from the book 1984.
+One thing that makes `quizzy` special is that quizzes are imported not through inputs and forms but from one JSON file that has all the questions. Here's an example of a quiz with 3 questions taken from the book 1984.
 
 ```json
 [
