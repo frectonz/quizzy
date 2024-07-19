@@ -137,6 +137,12 @@ mod db {
         pub id: i32,
         pub quiz_id: i32,
         pub question_idx: i32,
+        pub name: String,
+    }
+
+    pub struct AnswerModel {
+        pub question: String,
+        pub is_correct: bool,
     }
 
     #[derive(Clone)]
@@ -488,7 +494,7 @@ mod db {
         pub async fn get_submission(&self, cookie: &str) -> Result<SubmissionModel> {
             let conn = self.db.connect()?;
             conn.query(
-                "SELECT id, quiz_id, question_idx FROM submissions WHERE cookie = ?",
+                "SELECT id, quiz_id, question_idx, name FROM submissions WHERE cookie = ?",
                 params![cookie],
             )
             .await?
@@ -498,6 +504,25 @@ mod db {
                 id: r.get::<i32>(0).expect("failed to get submission id"),
                 quiz_id: r.get::<i32>(1).expect("failed to get quiz id"),
                 question_idx: r.get::<i32>(2).expect("failed to get question index"),
+                name: r.get::<String>(3).expect("failed to get submission name"),
+            })
+            .ok_or_eyre("could not get submission")
+        }
+
+        pub async fn get_submission_with_id(&self, submission_id: i32) -> Result<SubmissionModel> {
+            let conn = self.db.connect()?;
+            conn.query(
+                "SELECT id, quiz_id, question_idx, name FROM submissions WHERE id = ?",
+                params![submission_id],
+            )
+            .await?
+            .next()
+            .await?
+            .map(|r| SubmissionModel {
+                id: r.get::<i32>(0).expect("failed to get submission id"),
+                quiz_id: r.get::<i32>(1).expect("failed to get quiz id"),
+                question_idx: r.get::<i32>(2).expect("failed to get question index"),
+                name: r.get::<String>(3).expect("failed to get submission name"),
             })
             .ok_or_eyre("could not get submission")
         }
@@ -535,6 +560,41 @@ mod db {
             );
 
             Ok(())
+        }
+
+        pub async fn correct_answers(&self, submission_id: i32) -> Result<i32> {
+            let conn = self.db.connect()?;
+            Ok(conn
+                .query(
+                    "SELECT count(*) FROM answers WHERE submission_id = ? AND is_correct",
+                    params![submission_id],
+                )
+                .await?
+                .next()
+                .await?
+                .ok_or_eyre("could not get questions count")?
+                .get::<i32>(0)?)
+        }
+
+        pub async fn get_answers(&self, submission_id: i32) -> Result<Vec<AnswerModel>> {
+            let conn = self.db.connect()?;
+            Ok(conn
+                .query(
+                    r#"
+                SELECT questions.question, answers.is_correct
+                FROM answers JOIN questions ON answers.question_id = questions.id
+                WHERE submission_id = ?"#,
+                    params![submission_id],
+                )
+                .await?
+                .into_stream()
+                .map_ok(|r| AnswerModel {
+                    question: r.get::<String>(0).expect("failed to get answer question"),
+                    is_correct: r.get::<bool>(1).expect("failed to get answer correctness"),
+                })
+                .filter_map(|r| future::ready(r.ok()))
+                .collect::<Vec<_>>()
+                .await)
         }
 
         pub async fn increase_question_index(&self, submission_id: i32) -> Result<()> {
@@ -1087,10 +1147,17 @@ mod quiz {
             .and(warp::body::json::<SubmitAnswerBody>())
             .and_then(submit_answer);
 
+        let submission_result = warp::get()
+            .and(with_state(conn.clone()))
+            .and(is_htmx())
+            .and(warp::path!("results" / i32))
+            .and_then(submission_result);
+
         quiz_dashboard
             .or(quiz_page)
             .or(start_submission)
             .or(submit_answer)
+            .or(submission_result)
     }
 
     async fn quiz_dashboard(
@@ -1210,7 +1277,14 @@ mod quiz {
                 })?;
         }
 
-        let page = answer(&db, submission.quiz_id, submission.question_idx, answer_id).await?;
+        let page = answer(
+            &db,
+            submission.quiz_id,
+            submission.question_idx,
+            answer_id,
+            submission.id,
+        )
+        .await?;
 
         let resp = if is_final {
             let cookie = utils::cookie(names::SUBMISSION_COOKIE_NAME, "");
@@ -1223,6 +1297,83 @@ mod quiz {
         };
 
         Ok(resp)
+    }
+
+    async fn submission_result(
+        db: Db,
+        is_htmx: bool,
+        submission_id: i32,
+    ) -> Result<impl warp::Reply, warp::Rejection> {
+        let submission = db
+            .get_submission_with_id(submission_id)
+            .await
+            .map_err(|e| {
+                tracing::error!("could not get submission with id {submission_id}: {e}");
+                warp::reject::custom(InternalServerError)
+            })?;
+
+        let questions_count = db.questions_count(submission.quiz_id).await.map_err(|e| {
+            tracing::error!(
+                "could not get question count for quiz_id {}: {e}",
+                submission.quiz_id
+            );
+            warp::reject::custom(InternalServerError)
+        })?;
+
+        let page = if submission.question_idx + 1 != questions_count {
+            html! { "Quiz has not been finished." }
+        } else {
+            let correct_answers = db.correct_answers(submission.id).await.map_err(|e| {
+                tracing::error!(
+                    "could not get correct answer count for submission with id {}: {e}",
+                    submission.id
+                );
+                warp::reject::custom(InternalServerError)
+            })?;
+
+            let answers = db.get_answers(submission.id).await.map_err(|e| {
+                tracing::error!(
+                    "could not get answers for submission with id {}: {e}",
+                    submission.id
+                );
+                warp::reject::custom(InternalServerError)
+            })?;
+
+            let quiz_name = db.quiz_name(submission.quiz_id).await.map_err(|e| {
+                tracing::error!("could not quiz name with id {}: {e}", submission.quiz_id);
+                warp::reject::custom(InternalServerError)
+            })?;
+
+            html! {
+                h5 {  mark { (quiz_name) } }
+                h1 {
+                    mark { (submission.name) }
+                    " scored "
+                    mark { (correct_answers) "/" (questions_count) }
+                    " on the quiz."
+                }
+                table {
+                    thead { tr {
+                        th { "Question" }
+                        th { "Correct" }
+                    } }
+                    tbody {
+                        @for answer in answers {
+                            tr {
+                                td { (answer.question) }
+                                td { (if answer.is_correct { "🟢" } else { "🔴" }) }
+                             }
+                        }
+                    }
+                }
+            }
+        };
+
+        Ok(if is_htmx {
+            views::titled("Results", page)
+        } else {
+            views::page("Results", page)
+        })
     }
 
     pub async fn question(db: &Db, quiz_id: i32, question_idx: i32) -> Result<Markup, Rejection> {
@@ -1281,6 +1432,7 @@ mod quiz {
         quiz_id: i32,
         question_idx: i32,
         selected: i32,
+        submission_id: i32,
     ) -> Result<Markup, Rejection> {
         let quiz_name = db.quiz_name(quiz_id).await.map_err(|e| {
             tracing::error!("could not get quiz name for quiz={quiz_id}: {e}");
@@ -1331,8 +1483,12 @@ mod quiz {
                     }
                 }
 
-                button hx-get=(names::quiz_page_url(quiz_id)) hx-target="main" hx-disabled-elt="this" {
-                    @if is_final { "Finish" } @else { "Next" }
+                @if is_final {
+                    button hx-get=(names::results_url(submission_id))
+                           hx-target="main" hx-disabled-elt="this" { "See Results" }
+                } @else {
+                    button hx-get=(names::quiz_page_url(quiz_id))
+                           hx-target="main" hx-disabled-elt="this" { "Next" }
                 }
             }
         })
@@ -1418,6 +1574,10 @@ mod names {
 
     pub fn start_submission_url(quiz_id: i32) -> String {
         format!("/start-submission/{quiz_id}")
+    }
+
+    pub fn results_url(submission_id: i32) -> String {
+        format!("/results/{submission_id}")
     }
 }
 
