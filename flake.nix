@@ -49,6 +49,7 @@
           name = "quizzy";
           tag = "latest";
           created = "now";
+          contents = with pkgs; [ cacert ];
           config.Cmd = [ "${bin}/bin/quizzy" ];
           config.Expose = "1414";
         };
