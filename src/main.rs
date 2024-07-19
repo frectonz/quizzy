@@ -1485,6 +1485,7 @@ mod quiz {
 
                 @if is_final {
                     button hx-get=(names::results_url(submission_id))
+                           hx-push-url="true"
                            hx-target="main" hx-disabled-elt="this" { "See Results" }
                 } @else {
                     button hx-get=(names::quiz_page_url(quiz_id))
