@@ -14,13 +14,13 @@ A simple dockerized self hostable quiz app which use a `libSQL` database from [T
 ### Install prebuilt binaries via shell script (MacOS and Linux)
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/frectonz/quizzy/releases/download/0.1.0/quizzy-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/frectonz/quizzy/releases/download/0.1.1/quizzy-installer.sh | sh
 ```
 
 ### Install prebuilt binaries via powershell script (Windows)
 
 ```sh
-powershell -c "irm https://github.com/frectonz/quizzy/releases/download/0.1.0/quizzy-installer.ps1 | iex"
+powershell -c "irm https://github.com/frectonz/quizzy/releases/download/0.1.1/quizzy-installer.ps1 | iex"
 ```
 
 ### Updating
