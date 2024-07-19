@@ -1,5 +1,3 @@
-
-https://github.com/user-attachments/assets/8a88d11a-4528-4961-b587-e9774d5bea50
 # quizzy
 
 A simple dockerized configurable self-hostable quiz app that uses a `libSQL` database from [Turso](https://turso.tech/).
