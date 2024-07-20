@@ -493,6 +493,20 @@ mod db {
                 .get::<i32>(0)?)
         }
 
+        pub async fn submissions_count(&self, quiz_id: i32) -> Result<i32> {
+            let conn = self.db.connect()?;
+            Ok(conn
+                .query(
+                    "SELECT count(*) FROM submissions WHERE quiz_id = ?",
+                    params![quiz_id],
+                )
+                .await?
+                .next()
+                .await?
+                .ok_or_eyre("could not get submissions count")?
+                .get::<i32>(0)?)
+        }
+
         pub async fn get_submission(&self, cookie: &str) -> Result<SubmissionModel> {
             let conn = self.db.connect()?;
             conn.query(
@@ -1262,7 +1276,7 @@ mod quiz {
 
         let questions_count = db.questions_count(submission.quiz_id).await.map_err(|e| {
             tracing::error!(
-                "could not get question cout for quiz_id={}: {e}",
+                "could not get question count for quiz_id={}: {e}",
                 submission.quiz_id
             );
             warp::reject::custom(InternalServerError)
@@ -1400,7 +1414,7 @@ mod quiz {
         })?;
 
         let questions_count = db.questions_count(quiz_id).await.map_err(|e| {
-            tracing::error!("could not get question cout for quiz_id={quiz_id}: {e}");
+            tracing::error!("could not get question count for quiz_id={quiz_id}: {e}");
             warp::reject::custom(InternalServerError)
         })?;
 
@@ -1457,7 +1471,7 @@ mod quiz {
         })?;
 
         let questions_count = db.questions_count(quiz_id).await.map_err(|e| {
-            tracing::error!("could not get question cout for quiz_id={quiz_id}: {e}");
+            tracing::error!("could not get question count for quiz_id={quiz_id}: {e}");
             warp::reject::custom(InternalServerError)
         })?;
 
@@ -1540,9 +1554,16 @@ mod quiz {
             warp::reject::custom(InternalServerError)
         })?;
 
+        let questions_count = db.submissions_count(quiz_id).await.map_err(|e| {
+            tracing::error!("could not get submissions count for quiz_id={quiz_id}: {e}",);
+            warp::reject::custom(InternalServerError)
+        })?;
+
+        let submissions_count = 0;
+
         Ok(html! {
             h1 { (quiz_name) }
-            p { "Dashboard for quiz number " (quiz_id) "." }
+            p { "This quiz has " mark { (questions_count) " questions" } " and " mark { (submissions_count) " submissions" } "." }
             article style="width: fit-content;" {
                 h4 { "Share this link to people so that they can do the quiz." }
                 p id="url" { "" }
