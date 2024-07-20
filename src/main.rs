@@ -147,6 +147,17 @@ mod db {
         pub is_correct: bool,
     }
 
+    pub struct ReportQuestionModel {
+        pub question: String,
+        pub correct_answers: i32,
+    }
+
+    pub struct ReportSubmissionModel {
+        pub id: i32,
+        pub name: String,
+        pub score: i32,
+    }
+
     #[derive(Clone)]
     pub struct Db {
         db: Arc<libsql::Database>,
@@ -625,6 +636,58 @@ mod db {
 
             tracing::info!("question index increased for submission={submission_id}: {rows:?}");
             Ok(())
+        }
+
+        pub async fn get_questions_report(&self, quiz_id: i32) -> Result<Vec<ReportQuestionModel>> {
+            let conn = self.db.connect()?;
+            Ok(conn
+                .query(
+                    r#"
+                SELECT questions.question, count(*)
+                FROM questions JOIN answers ON answers.question_id = questions.id
+                WHERE questions.quiz_id = ? AND answers.is_correct
+                GROUP BY questions.question
+                    "#,
+                    params![quiz_id],
+                )
+                .await?
+                .into_stream()
+                .map_ok(|r| ReportQuestionModel {
+                    question: r.get::<String>(0).expect("failed to get question"),
+                    correct_answers: r
+                        .get::<i32>(1)
+                        .expect("failed to get correct answers count"),
+                })
+                .filter_map(|r| future::ready(r.ok()))
+                .collect::<Vec<_>>()
+                .await)
+        }
+
+        pub async fn get_submissions_report(
+            &self,
+            quiz_id: i32,
+        ) -> Result<Vec<ReportSubmissionModel>> {
+            let conn = self.db.connect()?;
+            Ok(conn
+                .query(
+                    r#"
+                SELECT submissions.id, submissions.name, count(*)
+                FROM submissions JOIN answers ON answers.submission_id = submissions.id
+                WHERE submissions.quiz_id = ? AND answers.is_correct
+                GROUP BY submissions.name
+                    "#,
+                    params![quiz_id],
+                )
+                .await?
+                .into_stream()
+                .map_ok(|r| ReportSubmissionModel {
+                    id: r.get::<i32>(0).expect("failed to get submission id"),
+                    name: r.get::<String>(1).expect("failed to get submission name"),
+                    score: r.get::<i32>(2).expect("failed to get submission's score"),
+                })
+                .filter_map(|r| future::ready(r.ok()))
+                .collect::<Vec<_>>()
+                .await)
         }
     }
 }
@@ -1554,12 +1617,25 @@ mod quiz {
             warp::reject::custom(InternalServerError)
         })?;
 
-        let questions_count = db.submissions_count(quiz_id).await.map_err(|e| {
+        let questions_count = db.questions_count(quiz_id).await.map_err(|e| {
+            tracing::error!("could not get question count for quiz_id={quiz_id}: {e}",);
+            warp::reject::custom(InternalServerError)
+        })?;
+
+        let submissions_count = db.submissions_count(quiz_id).await.map_err(|e| {
             tracing::error!("could not get submissions count for quiz_id={quiz_id}: {e}",);
             warp::reject::custom(InternalServerError)
         })?;
 
-        let submissions_count = 0;
+        let questions = db.get_questions_report(quiz_id).await.map_err(|e| {
+            tracing::error!("could not get questions report for quiz_id={quiz_id}: {e}",);
+            warp::reject::custom(InternalServerError)
+        })?;
+
+        let submissions = db.get_submissions_report(quiz_id).await.map_err(|e| {
+            tracing::error!("could not get questions report for quiz_id={quiz_id}: {e}",);
+            warp::reject::custom(InternalServerError)
+        })?;
 
         Ok(html! {
             h1 { (quiz_name) }
@@ -1569,6 +1645,42 @@ mod quiz {
                 p id="url" { "" }
                 script {
                     "document.querySelector('#url').textContent = `${window.location.origin}/quiz/" (quiz_id) "`;"
+                }
+            }
+
+            table {
+                thead { tr {
+                    th { "Question" }
+                    th { "Correct Answers" }
+                } }
+                tbody {
+                    @for question in questions {
+                        tr {
+                            td { (question.question) }
+                            td { (question.correct_answers) }
+                         }
+                    }
+                }
+            }
+
+            table {
+                thead { tr {
+                    th { "Submission" }
+                    th { "Score" }
+                    th { "Actions" }
+                } }
+                tbody {
+                    @for submission in submissions {
+                        tr {
+                            td { (submission.name) }
+                            td { (submission.score) "/" (questions_count) }
+                            td { a hx-get=(names::results_url(submission.id))
+                                   hx-push-url="true"
+                                   hx-target="main"
+                                   href="#" { "See Results" }
+                            }
+                         }
+                    }
                 }
             }
         })
