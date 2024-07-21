@@ -33,6 +33,8 @@ One thing that makes `quizzy` special is that quizzes are imported not through i
 ]
 ```
 
+Sample quizzes for [1984](https://github.com/frectonz/book-quizes/tree/main/quizes/1984) and [The Hitchhiker's Guide to the Galaxy](https://github.com/frectonz/book-quizes/tree/main/quizes/hitchhiker's-guide-to-the-galaxy) are available.
+
 ## Demo
 
 https://github.com/user-attachments/assets/4904b249-da95-4e08-b20a-45f25ed7f779
