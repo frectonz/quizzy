@@ -1,7 +1,12 @@
 use clap::Parser;
 use db::Db;
 use futures::{future::OptionFuture, FutureExt};
+use maud::Markup;
 use warp::Filter;
+
+fn render(m: Markup) -> warp::reply::Html<String> {
+    warp::reply::html(m.into_string())
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -87,7 +92,7 @@ mod statics {
         let resp = Response::builder()
             .header(CONTENT_TYPE, content_type)
             .header(CACHE_CONTROL, "max-age=3600, must-revalidate")
-            .body(file.contents())
+            .body(bytes::Bytes::from_static(file.contents()))
             .unwrap();
 
         Ok(resp)
@@ -808,7 +813,7 @@ mod homepage {
 
     use crate::{
         db::Db,
-        is_authorized, model, names, quiz,
+        is_authorized, model, names, quiz, render,
         rejections::{InputError, InternalServerError},
         utils, views, with_state, FutureOptionExt,
     };
@@ -877,7 +882,7 @@ mod homepage {
             .unwrap_or_default();
 
         if session_exists {
-            Ok(views::page("Dashboard", dashboard(&db).await?))
+            Ok(render(views::page("Dashboard", dashboard(&db).await?)))
         } else {
             let admin_password = db.admin_password().await.map_err(|e| {
                 tracing::error!("could not get admin password: {e}");
@@ -885,8 +890,8 @@ mod homepage {
             })?;
 
             match admin_password {
-                Some(_) => Ok(views::page("Welcome Back", login(LoginState::NoError))),
-                None => Ok(views::page("Get Started", get_started())),
+                Some(_) => Ok(render(views::page("Welcome Back", login(LoginState::NoError)))),
+                None => Ok(render(views::page("Get Started", get_started()))),
             }
         }
     }
@@ -946,7 +951,7 @@ mod homepage {
 
             Ok(resp.into_response())
         } else {
-            Ok(views::titled("Welcome Back", login(LoginState::IncorrectPassword)).into_response())
+            Ok(render(views::titled("Welcome Back", login(LoginState::IncorrectPassword))).into_response())
         }
     }
 
@@ -1012,7 +1017,7 @@ mod homepage {
             warp::reject::custom(InternalServerError)
         })?;
 
-        Ok(html!())
+        Ok(render(html!()))
     }
 
     fn get_started() -> Markup {
@@ -1181,7 +1186,7 @@ mod quiz {
 
     use crate::{
         db::Db,
-        is_authorized, is_htmx, names,
+        is_authorized, is_htmx, names, render,
         rejections::{InputError, InternalServerError},
         utils, views, with_state,
     };
@@ -1245,11 +1250,11 @@ mod quiz {
         db: Db,
         quiz_id: i32,
     ) -> Result<impl warp::Reply, warp::Rejection> {
-        Ok(if is_htmx {
+        Ok(render(if is_htmx {
             views::titled("Quiz Dashboard", dashboard(&db, quiz_id).await?)
         } else {
             views::page("Quiz Dashboard", dashboard(&db, quiz_id).await?)
-        })
+        }))
     }
 
     async fn start_submission(
@@ -1304,9 +1309,9 @@ mod quiz {
         };
 
         if is_htmx {
-            Ok(views::titled("Quiz", page))
+            Ok(render(views::titled("Quiz", page)))
         } else {
-            Ok(views::page("Quiz", page))
+            Ok(render(views::page("Quiz", page)))
         }
     }
 
@@ -1448,11 +1453,11 @@ mod quiz {
             }
         };
 
-        Ok(if is_htmx {
+        Ok(render(if is_htmx {
             views::titled("Results", page)
         } else {
             views::page("Results", page)
-        })
+        }))
     }
 
     pub async fn question(db: &Db, quiz_id: i32, question_idx: i32) -> Result<Markup, Rejection> {
@@ -1755,7 +1760,7 @@ mod rejections {
         reply::Reply,
     };
 
-    use crate::views;
+    use crate::{render, views};
 
     macro_rules! rejects {
         ($($name:ident),*) => {
@@ -1807,7 +1812,7 @@ mod rejections {
             message = "UNHANDLED_REJECTION";
         }
 
-        Ok(warp::reply::with_status(error_page(message), code))
+        Ok(warp::reply::with_status(render(error_page(message)), code))
     }
 
     fn error_page(message: &str) -> Markup {
